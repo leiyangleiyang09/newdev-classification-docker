@@ -1,0 +1,144 @@
+defaults: &defaults
+  TEAM_NAME: data-science-nlp
+  AWS_DEFAULT_REGION: ap-southeast-2
+  AWS_REGION: ap-southeast-2
+  AWS_ECR_ACCOUNT_URL: "087619010168.dkr.ecr.ap-southeast-2.amazonaws.com"
+
+version: 2.1
+orbs:
+  aws-ecr: circleci/aws-ecr@7.0.0
+  aws-cli: circleci/aws-cli@2.0.3
+commands:
+  build-and-push-image: aws-ecr/build-and-push-image
+jobs:
+  lint-and-unit-test:
+      working_directory: ~/tmp
+      docker:
+        - image: circleci/python:3.7.10
+      steps:
+        - checkout
+        - run: sudo chown -R circleci:circleci /usr/local/bin
+        - run: sudo chown -R circleci:circleci /usr/local/lib/python3.7/site-packages
+        - restore_cache:
+            key: ${CIRCLE_PROJECT_REPONAME}-{{ checksum "requirements-dev.txt" }}
+        - run:
+            name: Setup virtualenv and install dependencies
+            command: |
+              make env.setup-ci
+        - save_cache:
+            key: ${CIRCLE_PROJECT_REPONAME}-{{ checksum "requirements-dev.txt" }}
+            paths:
+              - ".venv"
+              - "/usr/local/bin"
+              - "/usr/local/lib/python3.7/site-packages"
+        - run:
+            name: Run linting
+            command: |
+              make test.lint
+        - run:
+            name: Run unit tests
+            command: |
+              make test.unit
+  create-registry-dev: &CREATE-REGISTRY
+    executor: aws-cli/default
+    environment:
+      <<: *defaults
+      STAGE: $(echo "${CIRCLE_USERNAME}" | awk '{print tolower($0)}')-dev
+    steps:
+      - checkout
+      - aws-cli/setup
+      - run:
+          name: Create ECR repository
+          command: |
+            APP_NAME=${CIRCLE_PROJECT_REPONAME}-$(eval echo ${STAGE})
+            echo $APP_NAME
+            aws ecr describe-repositories --repository-names ${APP_NAME} || aws ecr create-repository \
+              --tag Key=Environmnet,Value=dev Key=Application,Value=${CIRCLE_PROJECT_REPONAME} Key=Name,Value=${TEAM_NAME} \
+              --image-tag-mutability MUTABLE \
+              --repository-name ${APP_NAME}
+
+  create-registry-stg:
+    <<: *CREATE-REGISTRY
+    environment:
+      <<: *defaults
+      STAGE: stg
+
+  create-registry-prd:
+    <<: *CREATE-REGISTRY
+    environment:
+      <<: *defaults
+      STAGE: prd
+
+  build-and-push-image-dev: &BUILD-PUSH-JOB
+    executor: aws-ecr/default
+    environment:
+      <<: *defaults
+      STAGE: $(echo "${CIRCLE_USERNAME}" | awk '{print tolower($0)}')-dev
+      TAG: $(echo "${CIRCLE_BRANCH}" | awk '{print tolower($0)}' | sed -e 's/[^a-zA-Z0-9 -\.]/-/g')
+    steps:
+      - build-and-push-image:
+          repo: "${CIRCLE_PROJECT_REPONAME}-$(eval echo ${STAGE})"
+          tag: "latest,$(eval echo ${TAG})"
+
+  build-and-push-image-stg:
+    <<: *BUILD-PUSH-JOB
+    environment:
+      <<: *defaults
+      STAGE: stg
+      TAG: $(echo "${CIRCLE_BRANCH}" | awk '{print tolower($0)}' | sed -e 's/[^a-zA-Z0-9 -\.]/-/g')
+
+  build-and-push-image-prd:
+    <<: *BUILD-PUSH-JOB
+    environment:
+      <<: *defaults
+      STAGE: prd
+      TAG: $(echo "${CIRCLE_TAG}" | awk '{print tolower($0)}' | sed -e 's/[^a-zA-Z0-9 -\.]/-/g')
+
+workflows:
+  build-test-and-deploy:
+    jobs:
+      - lint-and-unit-test
+         
+      # DEVELOPMENT
+      - create-registry-dev:
+          requires:
+            - lint-and-unit-test
+          filters:
+            branches:
+              ignore: master
+      - build-and-push-image-dev:
+          requires:
+            - create-registry-dev
+          filters:
+            branches:
+              ignore: master
+
+      # STAGING
+      - create-registry-stg:
+          requires:
+            - lint-and-unit-test
+          filters:
+            branches:
+              only: master
+      - build-and-push-image-stg:
+          requires:
+            - create-registry-stg
+          filters:
+            branches:
+              only: master
+
+      # PRODUCTION
+      - create-registry-prd:
+          filters:
+            tags:
+              only: /^v.*/
+            branches:
+              ignore: /.*/
+      - build-and-push-image-prd:
+          requires:
+            - create-registry-prd
+          filters:
+            tags:
+              only: /^v.*/
+            branches:
+              ignore: /.*/
